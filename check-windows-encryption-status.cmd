@@ -69,51 +69,116 @@ exit /b %errorlevel%
 $currentPrincipal = New-Object Security.Principal.WindowsPrincipal([Security.Principal.WindowsIdentity]::GetCurrent())
 if (! $currentPrincipal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
   (get-host).UI.RawUI.Foregroundcolor="DarkRed"
-  write-host "`nWarning: This script must be run as an Administrator.`n"
+  Write-Host "`nWarning: This script must be run as an Administrator.`n"
   (get-host).UI.RawUI.Foregroundcolor="White"
   exit
 }
 
- 
-# Check Device Encryption Status of Each Drive
-function Get-DeviceEncryptionStatus {
+
+# Check Encryption Status of Each Drive with VeraCrypt
+function GetDriveVCEncryptionStatus {
 	param (
-		[string[]]$drives
+		[boolean]$bSystemDriveEncrypted = $FALSE
 	)
-	
-	$systemDrive = (Get-WmiObject Win32_OperatingSystem).SystemDrive
-	$bFullyEncrypted = $TRUE
-	
-	foreach ($driveLetter in $drives) {
-		if ($systemDrive -eq "${driveLetter}:") {
+
+	$bAllDrivesVCEncrypted = $FALSE
+	$bSomeDrivesVCEncrypted = $FALSE
+
+	$aMountedDriveList = [System.Collections.ArrayList]@()
+
+	$tMountList = New-Object MOUNT_LIST_STRUCT
+	$tMountListSize = [System.Runtime.InteropServices.Marshal]::SizeOf($tMountList)
+
+	# create output buffer to hold a MOUNT_LIST_STRUCT struct
+	$OutBuffer = [System.Runtime.InteropServices.Marshal]::AllocHGlobal($tMountListSize)
+
+	$result = $NtFunctions::DeviceIoControl($hDriver, $VC_IOCTL_GET_MOUNTED_VOLUMES, $NULL, 0, $OutBuffer, $tMountListSize, [ref]$BytesReturned, [System.IntPtr]::Zero)
+	if ($result) {
+		$tMountList=[System.Runtime.InteropServices.Marshal]::PtrToStructure($OutBuffer, [System.Type] $tMountList.GetType())
+		For ($i = 0; $i -lt 26; $i++) {
+			If ($tMountList.ulMountedDrives -band (1 -shl $i)) {
+				$index = $aMountedDriveList.Add([char]([byte][char]'A' + $i) + ":")
+			}
+		}
+	}
+
+	# Free previously allocated memory
+	[System.Runtime.InteropServices.Marshal]::FreeHGlobal($OutBuffer)
+
+	$aDisplayBuffer = [System.Collections.ArrayList]@()
+	$aDrivesRequiringEncryption = [System.Collections.ArrayList]@()
+	$g_oDrives | ForEach-Object {
+		# Note: The system drive when encrypted does not get listed as a mounted encrypted drive for some reason
+		if (-Not ($bSystemDriveEncrypted -And $_.DriveLetter -eq $g_SystemDrive) -And $aMountedDriveList -notcontains $_.DriveLetter) {
+			$index = $aDrivesRequiringEncryption.Add($_.DriveLetter)
+		} else {
+			$bSomeDrivesVCEncrypted = $TRUE
+			$index = $aDisplayBuffer.Add("Drive $($_.DriveLetter) is encrypted using VeraCrypt.")
+			$index = $g_aEncryptedDrives.Add($_.DriveLetter)
+		}
+	}
+	if ($aDisplayBuffer.count -gt 0) {
+		Write-Host
+		Write-Host ($aDisplayBuffer -join "`n")
+	}
+
+	if ($aDrivesRequiringEncryption.count -eq 0) {
+		$bAllDrivesVCEncrypted = $TRUE
+	} else {
+		if ($bSystemDriveEncrypted -Or ($aDrivesRequiringEncryption.count -ne $g_oDrives.count)) {
+			Write-Host
+			Write-Host "The following drives do not appear to be encrypted using VeraCrypt:"
+			Write-Host ($aDrivesRequiringEncryption -join "`n")
+		}
+	}
+
+	return $bAllDrivesVCEncrypted, $bSomeDrivesVCEncrypted
+}
+
+
+# Check Encryption Status of Each Drive with Device Encryption/Bitlocker
+function GetDeviceEncryptionStatus {
+	$bAllDrivesEncrypted = $TRUE
+	$bSomeDrivesEncrypted = $FALSE
+
+	$aDisplayBuffer = [System.Collections.ArrayList]@()
+	$g_oDrives | ForEach-Object {
+		$driveLetter = $_.DriveLetter
+		if ($driveLetter -eq $g_SystemDrive) {
 			$driveType = "system drive"
 		} else {
 			$driveType = "drive"
 		}
 		
-		$drive = Get-WmiObject -Namespace "Root\CIMv2\Security\MicrosoftVolumeEncryption" -Class Win32_EncryptableVolume | Where-Object { $_.DriveLetter -eq "${driveLetter}:" }
+		$drive = Get-WmiObject -Namespace "Root\CIMv2\Security\MicrosoftVolumeEncryption" -Class Win32_EncryptableVolume | Where-Object { $_.DriveLetter -eq $driveLetter }
 		if ($drive) {
 			$protectionStatus = $drive.ProtectionStatus
 			if ($protectionStatus -eq 1) {
-				Write-Host "Device Encryption is enabled and active on the ${driveType} (${driveLetter}:)."
+				$bSomeDrivesEncrypted = $TRUE
+				$index = $g_aEncryptedDrives.Add($driveLetter)
+				$index = $aDisplayBuffer.Add("Device Encryption is enabled and active on the ${driveType} (${driveLetter}).")
 			} else {
 				$conversionStatus = $drive.conversionStatus
 				switch ($conversionStatus)
 				{
-					0 { Write-Host "Device Encryption is not enabled on the ${driveType} (${driveLetter}:)."; break }
-					1 { Write-Host "Device Encryption is not enabled on the ${driveType} (${driveLetter}:) but the drive conversion status is 'Fully Encrypted'."; break }
-					2 { Write-Host "Device Encryption is not enabled on the ${driveType} (${driveLetter}:) but the drive conversion status is 'Encryption in Progress'."; break }
-					3 { Write-Host "Device Encryption is not enabled on the ${driveType} (${driveLetter}:) and the drive conversion status is 'Decryption in Progress'."; break }
-					4 { Write-Host "Device Encryption is not enabled on the ${driveType} (${driveLetter}:) but the drive conversion status is 'Encryption Paused'."; break }
-					5 { Write-Host "Device Encryption is not enabled on the ${driveType} (${driveLetter}:) and the drive conversion status is 'Decryption Paused'."; break }
-					Default { Write-Host "Device Encryption is not enabled on the ${driveType} (${driveLetter}:) but the drive conversion status is unknown."; break }
+					0 { $index = $aDisplayBuffer.Add("Device Encryption is not enabled on the ${driveType} (${driveLetter})."); break }
+					1 { $index = $aDisplayBuffer.Add("Device Encryption is not enabled on the ${driveType} (${driveLetter}) but the drive conversion status is 'Fully Encrypted'."); break }
+					2 { $index = $aDisplayBuffer.Add("Device Encryption is not enabled on the ${driveType} (${driveLetter}) but the drive conversion status is 'Encryption in Progress'."); break }
+					3 { $index = $aDisplayBuffer.Add("Device Encryption is not enabled on the ${driveType} (${driveLetter}) and the drive conversion status is 'Decryption in Progress'."); break }
+					4 { $index = $aDisplayBuffer.Add("Device Encryption is not enabled on the ${driveType} (${driveLetter}) but the drive conversion status is 'Encryption Paused'."); break }
+					5 { $index = $aDisplayBuffer.Add("Device Encryption is not enabled on the ${driveType} (${driveLetter}) and the drive conversion status is 'Decryption Paused'."); break }
+					Default { $index = $aDisplayBuffer.Add("Device Encryption is not enabled on the ${driveType} (${driveLetter}) but the drive conversion status is unknown."); break }
 				}
-				$bFullyEncrypted = $FALSE
+				$bAllDrivesEncrypted = $FALSE
 			}
 		}
 	}
-	
-	return $bFullyEncrypted
+	if ($bSomeDrivesEncrypted -and $aDisplayBuffer.count -gt 0) {
+		Write-Host
+		Write-Host ($aDisplayBuffer -join "`n")
+	}
+
+	return $bAllDrivesEncrypted, $bSomeDrivesEncrypted
 }
 
 function Display-Press-Any-Key {
@@ -123,9 +188,9 @@ function Display-Press-Any-Key {
 }
 
 function Get-OS-Name {
-	Write-Host ""
+	Write-Host
 	Write-Host "Retrieving operating system information.  Please wait..."
-	Write-Host ""
+	Write-Host
 
 	# Get Operating System Name and Version
 	$OriginalPref = $ProgressPreference # Default is 'Continue'
@@ -133,40 +198,12 @@ function Get-OS-Name {
 	$computerInfo = Get-ComputerInfo OsName, OsVersion
 	$ProgressPreference = $OriginalPref
 
+	Clear-Host
+	Write-Host
 	Write-Host "$($computerInfo.OsName) (Version $($computerInfo.OsVersion)) detected." -ForegroundColor yellow
-	Write-Host ""
 	
 	Return $computerInfo.OsName
 }
-
-# Initialize encryption status
-$bFullyEncrypted = $FALSE
-
-# Check Device Encryption status for Windows Pro and Windows Home
-if (Get-OS-Name -match "Windows 1(0|1) (Pro|Home)") {
-	# Get list of drive letters of all non-removable drives
-	$drives = (Get-PSDrive -PSProvider FileSystem).Name
-    $removableDrives = Get-WmiObject -Class Win32_LogicalDisk | Where-Object {$_.DriveType -eq 2}
-    if ($removableDrives -ne $NULL) {
-    	$drives = [Array]($drives | Where-Object { $removableDrives.DeviceID.Trim(":") -notcontains $_ })
-    }
-	$bFullyEncrypted = Get-DeviceEncryptionStatus $drives
-} else {
-    Write-Host "Using an unsupported Windows version is not secure." -ForegroundColor red
-	Display-Press-Any-Key
-	exit
-}
-
-Write-Host ""
-if ($bFullyEncrypted) {
-	Write-Host "This system has Microsoft Device Encryption or Bitlocker enabled for all drives." -ForegroundColor green
-	Display-Press-Any-Key
-	exit
-}
-
-Write-Host "This system is NOT using Microsoft Device Encryption or Bitlocker for all drives."
-Write-Host
-
 
 
 # from Win10 SDK source: include/10.0.16299.0/km/d4drvif.h
@@ -366,9 +403,46 @@ $VC_IOCTL_GET_MOUNTED_VOLUMES = VC_IOCTL 6
 $VC_IOCTL_GET_BOOT_ENCRYPTION_STATUS = VC_IOCTL 18
 
 
+# Initial array of encrypted drives
+$g_aEncryptedDrives = [System.Collections.ArrayList]@()
+
+# Initialize encryption status
+$bFullyEncrypted = $FALSE
+
+# get list of drives
+$g_oDrives = Get-WmiObject -Class Win32_Volume | Where-Object {$_.DriveType -eq 3 -and $_.FileSystem -ne $NULL -and $_.DriveLetter -ne $NULL}
+
+# get system drive
+$g_SystemDrive = (Get-WmiObject Win32_OperatingSystem).SystemDrive
+
+# Check Device Encryption status for Windows Pro and Windows Home
+$bEncryptedWithDeviceEncryption = $FALSE
+if (Get-OS-Name -match "Windows 1(0|1) (Pro|Home)") {
+	$bFullyEncrypted, $bEncryptedWithDeviceEncryption = GetDeviceEncryptionStatus
+} else {
+	Write-Host
+    Write-Host "Using an unsupported Windows version is not secure." -ForegroundColor red
+	Display-Press-Any-Key
+	exit
+}
+
+Write-Host
+if ($bFullyEncrypted) {
+	Write-Host "This system has Microsoft Device Encryption or Bitlocker enabled for all drives." -ForegroundColor green
+	Display-Press-Any-Key
+	exit
+}
+
+if (-Not $bEncryptedWithDeviceEncryption) {
+	Write-Host "The system is not encrypted with Microsoft Device Encryption or Bitlocker."
+	Write-Host
+}
+
 # Check if VeraCrypt is installed
 $bEncryptedWithVeraCrypt = $FALSE
 if ([Boolean](get-package | Where-Object {$_.Name -match "VeraCrypt"})) {
+	Write-Host "VeraCrypt is installed."
+
 	# Check if system is encrypted using VeraCrypt
 	$VERACRYPT_DRIVER_STR = '\\.\VeraCrypt'
 	$OPEN_EXISTING = 3
@@ -404,58 +478,23 @@ if ([Boolean](get-package | Where-Object {$_.Name -match "VeraCrypt"})) {
 			[System.Runtime.InteropServices.Marshal]::FreeHGlobal($OutBuffer)
 
 			if ($bSystemEncrypted) {
-				$bEncryptedWithVeraCrypt = $TRUE
-				
-				# determine encrypted system drive letter
-				$oSystemDrive = (Get-WmiObject Win32_OperatingSystem).SystemDrive
-
-				Write-Host "System drive (${oSystemDrive}) is encrypted using VeraCrypt."
-
-				$aMountedDriveList = [System.Collections.ArrayList]@()
-
-				$tMountList = New-Object MOUNT_LIST_STRUCT
-				$tMountListSize = [System.Runtime.InteropServices.Marshal]::SizeOf($tMountList)
-
-				# create output buffer to hold a MOUNT_LIST_STRUCT struct
-				$OutBuffer = [System.Runtime.InteropServices.Marshal]::AllocHGlobal($tMountListSize)
-
-				$result = $NtFunctions::DeviceIoControl($hDriver, $VC_IOCTL_GET_MOUNTED_VOLUMES, $NULL, 0, $OutBuffer, $tMountListSize, [ref]$BytesReturned, [System.IntPtr]::Zero)
-				if ($result) {
-					$tMountList=[System.Runtime.InteropServices.Marshal]::PtrToStructure($OutBuffer, [System.Type] $tMountList.GetType())
-					For ($i = 0; $i -lt 26; $i++) {
-						If ($tMountList.ulMountedDrives -band (1 -shl $i)) {
-							$index = $aMountedDriveList.Add([char]([byte][char]'A' + $i) + ":")
-						}
-					}
-				}
-
-				# Free previously allocated memory
-				[System.Runtime.InteropServices.Marshal]::FreeHGlobal($OutBuffer)
-
-				#$oAllDrives = (Get-PSDrive -PSProvider FileSystem).Name
-				$oNonSystemDrives = Get-WmiObject -Class Win32_Volume | Where-Object {$_.DriveType -eq 3 -and $_.FileSystem -ne $NULL -and $_.DriveLetter -ne $NULL -and $_.DriveLetter -ne $oSystemDrive}
-
-				$aDrivesRequiringEncryption = [System.Collections.ArrayList]@()
-				$oNonSystemDrives | ForEach-Object {
-					if ($aMountedDriveList -notcontains $_.DriveLetter) {
-						$index = $aDrivesRequiringEncryption.Add($_.DriveLetter)
-					} else {
-						Write-Host "Drive $($_.DriveLetter) is encrypted using VeraCrypt."
-					}
-				}
-
-				if ($aDrivesRequiringEncryption.count -eq 0) {
+				$bAllDrivesVCEncrypted, $bSomeDrivesVCEncrypted = GetDriveVCEncryptionStatus $TRUE
+				$bSomeDrivesVCEncrypted = $TRUE
+				if ($bAllDrivesVCEncrypted) {
 					$bFullyEncrypted = $TRUE
-				} else {
-					Write-Host
-					Write-Host "The following drives do not appear to be encrypted:"
-					Write-Host ($aDrivesRequiringEncryption -join "`n")
 				}
 			} else {
-				Write-Host "This system is not encrypted with VeraCrypt."
+				$bAllDrivesVCEncrypted, $bSomeDrivesVCEncrypted = GetDriveVCEncryptionStatus $FALSE
+				
+				if (-Not $bSomeDrivesVCEncrypted) {
+					Write-Host
+					Write-Host "This system is not encrypted with VeraCrypt."
+				}
 			}
+			$bEncryptedWithVeraCrypt = $bSomeDrivesVCEncrypted
 		} else {
 			$iErrorNum = [System.Runtime.InteropServices.Marshal]::GetLastWin32Error()
+			Write-Host
 			Write-Host "An unexpected error has occurred!  Error # ${iErrorNum}" - Foreground red
 		}
 	}
@@ -463,52 +502,68 @@ if ([Boolean](get-package | Where-Object {$_.Name -match "VeraCrypt"})) {
 	Write-Host "VeraCrypt is not installed."
 }
 
+# Check if BestCrypt is installed
+$bEncryptedWithBestcrypt = $FALSE
+Write-Host
+if (-not [Boolean](get-package | Where-Object {$_.Name -match "Bestcrypt"})) {
+	Write-Host "Bestcrypt is not installed."
+} else {
+	Write-Host "Bestcrypt is installed."
+
+	$p = Start-Process -FilePath "C:\Program Files (x86)\Jetico\BestCrypt Volume Encryption\bcfmgr.exe" -ArgumentList "-GetEncryptedVolumes" -Wait -NoNewWindow -PassThru
+	$iEncryptedDrivesBitmask = $p.ExitCode
+	if ($iEncryptedDrivesBitmask -eq 0) {
+		Write-Host
+		Write-Host "This system is not encrypted with Bestcrypt."
+	} else {
+		$bEncryptedWithBestcrypt = $TRUE
+		$aEncryptedDriveList = [System.Collections.ArrayList]@()
+		For ($i = 0; $i -lt 26; $i++) {
+			If ($iEncryptedDrivesBitmask -band (1 -shl $i)) {
+				$index = $aEncryptedDriveList.Add([char]([byte][char]'A' + $i) + ":")
+			}
+		}
+
+		$aDisplayBuffer = [System.Collections.ArrayList]@()
+		$aDrivesRequiringEncryption = [System.Collections.ArrayList]@()
+		#$oDrives = Get-WmiObject -Class Win32_Volume | Where-Object {$_.DriveType -eq 3 -and $_.FileSystem -ne $NULL -and $_.DriveLetter -ne $NULL}
+		$g_oDrives | ForEach-Object {
+			if ($aEncryptedDriveList -notcontains $_.DriveLetter) {
+				$index = $aDrivesRequiringEncryption.Add($_.DriveLetter)
+			} else {
+				$index = $aDisplayBuffer.Add("Drive $($_.DriveLetter) is encrypted using Bestcrypt.")
+				$index = $g_aEncryptedDrives.Add($_.DriveLetter)
+			}
+		}
+
+		if ($aDisplayBuffer.count -gt 0) {
+			Write-Host
+			Write-Host ($aDisplayBuffer -join "`n")
+		}
+
+		if ($aDrivesRequiringEncryption.count -eq 0) {
+			$bFullyEncrypted = $TRUE
+		} else {
+			Write-Host
+			Write-Host "The following drives do not appear to be encrypted using Bestcrypt:"
+			Write-Host ($aDrivesRequiringEncryption -join "`n")
+		}
+	}
+}
+
 if ($bFullyEncrypted) {
 	Write-Host
 	Write-Host "This system is fully encrypted." -ForegroundColor green
 } else {
 	Write-Host
-	if ($bEncryptedWithVeraCrypt) {
-		# Encrypted using VeraCrypt but only partially
-		Write-Host "This system is NOT fully encrypted." -ForegroundColor red
-	} else {
-		# Check if BestCrypt is installed
-		if (-not [Boolean](get-package | Where-Object {$_.Name -match "Bestcrypt"})) {
-			Write-Host "Bestcrypt is not installed."
-			Write-Host
-			Write-Host "This system is NOT encrypted." -ForegroundColor red
+	if ($bEncryptedWithDeviceEncryption -Or $bEncryptedWithVeraCrypt -Or $bEncryptedWithBestcrypt) {
+		if ($g_oDrives.count -eq $g_aEncryptedDrives.count) {
+			Write-Host "This system is fully encrypted." -ForegroundColor green
 		} else {
-			$p = Start-Process -FilePath "C:\Program Files (x86)\Jetico\BestCrypt Volume Encryption\bcfmgr.exe" -ArgumentList "-GetEncryptedVolumes" -Wait -NoNewWindow -PassThru
-			$iEncryptedDrivesBitmask = $p.ExitCode
-			$aEncryptedDriveList = [System.Collections.ArrayList]@()
-			For ($i = 0; $i -lt 26; $i++) {
-				If ($iEncryptedDrivesBitmask -band (1 -shl $i)) {
-					$index = $aEncryptedDriveList.Add([char]([byte][char]'A' + $i) + ":")
-				}
-			}
-
-			$aDrivesRequiringEncryption = [System.Collections.ArrayList]@()
-			$oDrives = Get-WmiObject -Class Win32_Volume | Where-Object {$_.DriveType -eq 3 -and $_.FileSystem -ne $NULL -and $_.DriveLetter -ne $NULL}
-			$oDrives | ForEach-Object {
-				if ($aEncryptedDriveList -notcontains $_.DriveLetter) {
-					$index = $aDrivesRequiringEncryption.Add($_.DriveLetter)
-				} else {
-					Write-Host "Drive $($_.DriveLetter) is encrypted using Bestcrypt."
-				}
-			}
-	
-			if ($aDrivesRequiringEncryption.count -eq 0) {
-				Write-Host
-				Write-Host "This system is fully encrypted." -ForegroundColor green
-			} else {
-				Write-Host
-				Write-Host "The following drives do not appear to be encrypted:"
-				Write-Host ($aDrivesRequiringEncryption -join "`n")
-
-				Write-Host
-				Write-Host "This system is NOT fully encrypted." -ForegroundColor red
-			}
+			Write-Host "This system is NOT fully encrypted." -ForegroundColor red
 		}
+	} else {
+		Write-Host "This system is NOT encrypted." -ForegroundColor red
 	}
 }
 
